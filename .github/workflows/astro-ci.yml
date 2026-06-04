@@ -1,0 +1,144 @@
+name: Astro CI (reusable)
+
+# Central reusable CI for Daedabyte Astro repos. Callers invoke it as:
+#   jobs:
+#     ci:
+#       uses: Daedabyte/.github/.github/workflows/astro-ci.yml@ci-v1
+# Resulting check contexts are prefixed by the caller job id, e.g. `ci / typecheck`.
+# See .ai/plans/github-optimization/01-reusable-ci-workflow.md (§4.1) — rulesets must
+# require the `ci / *` contexts, and the new contexts must report on a branch BEFORE
+# that branch's ruleset is switched to require them, or PRs lock.
+
+on:
+  workflow_call:
+    inputs:
+      site-dir:
+        description: "Workspace dir for the Astro app (root='.', monorepos='site' or 'daedabyte')."
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "22"
+      has-studio:
+        description: "Run the studio-build job against <studio-dir>."
+        type: boolean
+        default: false
+      studio-dir:
+        type: string
+        default: "studio"
+      build-script:
+        description: "npm script for the build check (CCC uses build:ci)."
+        type: string
+        default: "build"
+      run-lint:
+        description: "Run the lint check (CCC has no ESLint -> false)."
+        type: boolean
+        default: true
+      run-format:
+        description: "Run the format check (CCC has no Prettier -> false)."
+        type: boolean
+        default: true
+      # Public Sanity values, build-only. Empty for non-Sanity sites. Callers may pass
+      # literals (Littlecheese/MountHeritage/Daedabyte) or `${{ vars.* }}` (CCC).
+      public-sanity-project-id:
+        type: string
+        default: ""
+      public-sanity-dataset:
+        type: string
+        default: ""
+      # Optional build-time SITE_URL (CCC's build:ci relies on it). Empty = unset.
+      site-url:
+        type: string
+        default: ""
+
+jobs:
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - run: npm run typecheck
+
+  lint:
+    name: lint
+    if: ${{ inputs.run-lint }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - run: npm run lint
+
+  format:
+    name: format
+    if: ${{ inputs.run-format }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - run: npm run format:check
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      # build-script via env + quoting (avoids run-expression injection; enforces a single
+      # npm script name — compound builds must be a dedicated package.json script).
+      - env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+
+  studio-build:
+    name: studio-build
+    if: ${{ inputs.has-studio }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.studio-dir }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.studio-dir }}/package-lock.json
+      - run: npm ci --prefer-offline --no-audit --no-fund
+      - run: npm run build
