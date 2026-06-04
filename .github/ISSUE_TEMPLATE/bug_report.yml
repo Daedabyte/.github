@@ -1,0 +1,28 @@
+name: Bug report
+description: Something is broken on a site or in a repo
+labels: [bug]
+body:
+  - type: input
+    id: repo
+    attributes:
+      label: Affected repo / site
+      placeholder: e.g. RadicalMovers
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Expected vs. actual; URL + steps to reproduce
+    validations:
+      required: true
+  - type: dropdown
+    id: env
+    attributes:
+      label: Where
+      options:
+        - Production (main/Amplify)
+        - Staging
+        - Local dev
+    validations:
+      required: true

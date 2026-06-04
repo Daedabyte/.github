@@ -1,0 +1,17 @@
+name: Feature / change request
+description: A new feature or change to an existing site
+labels: [enhancement]
+body:
+  - type: input
+    id: repo
+    attributes:
+      label: Target repo / site
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What & why
+      description: The change and the problem it solves
+    validations:
+      required: true
