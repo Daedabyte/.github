@@ -51,6 +51,13 @@ on:
         type: string
         default: ""
 
+# Least-privilege default token: every job here only checks out + builds, so
+# read is all they need. Setting any key zeroes all unlisted scopes (packages,
+# id-token, pull-requests, etc.) — the desired least-privilege posture. A reusable
+# workflow's effective token is also bounded by the caller's grant.
+permissions:
+  contents: read
+
 jobs:
   typecheck:
     name: typecheck
@@ -59,8 +66,8 @@ jobs:
       run:
         working-directory: ${{ inputs.site-dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -76,8 +83,8 @@ jobs:
       run:
         working-directory: ${{ inputs.site-dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -93,8 +100,8 @@ jobs:
       run:
         working-directory: ${{ inputs.site-dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -113,8 +120,8 @@ jobs:
       PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
       SITE_URL: ${{ inputs.site-url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
@@ -134,8 +141,8 @@ jobs:
       run:
         working-directory: ${{ inputs.studio-dir }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
