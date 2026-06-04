@@ -5,9 +5,19 @@ name: Astro CI (reusable)
 #     ci:
 #       uses: Daedabyte/.github/.github/workflows/astro-ci.yml@ci-v1
 # Resulting check contexts are prefixed by the caller job id, e.g. `ci / typecheck`.
-# See .ai/plans/github-optimization/01-reusable-ci-workflow.md (§4.1) — rulesets must
-# require the `ci / *` contexts, and the new contexts must report on a branch BEFORE
-# that branch's ruleset is switched to require them, or PRs lock.
+#
+# Roadmap: #1 (centralization) · #6 (contents:read default + SHA-pinned actions) ·
+# #3 (CI-minutes: `setup` prewarm + shared node_modules cache, lockout-safe docs filter).
+# See .ai/plans/github-optimization/{01,03,06}-*.md.
+#
+# LOCKOUT SAFETY (#3): every required check job (typecheck/lint/format/build/studio-build)
+# ALWAYS runs and ALWAYS reports a status under its exact name. On a docs/.ai/markdown-only
+# change the heavy steps are skipped but the job still SUCCEEDS, so the ruleset-required
+# `ci / *` contexts are never missing -> a PR can never lock. Rules that keep this true:
+#   * NEVER add `paths-ignore`/`paths` to `on:` (a filtered-out workflow reports nothing).
+#   * NEVER give a required job a job-level `if:` that resolves to "skipped".
+#   * The `changes` filter FAILS SAFE: any uncertainty -> code='true' (full CI). Jobs treat
+#     ONLY an explicit code=='false' as "docs-only" -> if `changes` errored, real CI runs.
 
 on:
   workflow_call:
@@ -51,16 +61,64 @@ on:
         type: string
         default: ""
 
-# Least-privilege default token: every job here only checks out + builds, so
-# read is all they need. Setting any key zeroes all unlisted scopes (packages,
-# id-token, pull-requests, etc.) — the desired least-privilege posture. A reusable
+# Least-privilege default token: every job here only checks out + builds, so read is all
+# they need. Setting any key zeroes all unlisted scopes — the desired posture. A reusable
 # workflow's effective token is also bounded by the caller's grant.
 permissions:
   contents: read
 
 jobs:
-  typecheck:
-    name: typecheck
+  # Decide whether the change touches code (vs docs/.ai/markdown only) and compute the
+  # shared node_modules cache key ONCE. Runs at repo root (no site-dir working-directory).
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.meta.outputs.code }}
+      cache-key: ${{ steps.meta.outputs.cache-key }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SITE_DIR: ${{ inputs.site-dir }}
+          NODE_VERSION: ${{ inputs.node-version }}
+        run: |
+          set -uo pipefail
+          # Fail safe: assume code changed unless we can PROVE the diff is docs-only.
+          CODE=true
+          RANGE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE" >/dev/null 2>&1 || true
+            RANGE="origin/$BASE...HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="$BEFORE...HEAD"
+          fi
+          if [ -n "$RANGE" ]; then
+            if CHANGED=$(git diff --name-only "$RANGE" 2>/dev/null); then
+              # Strip docs paths (*.md, .ai/**, **/.ai/**, docs/**). Anything left = code.
+              # .github/workflows/* is NOT docs -> a CI change always forces a full run.
+              NONDOCS=$(printf '%s\n' "$CHANGED" | grep -vE '(\.md$|^\.ai/|/\.ai/|^docs/)' || true)
+              if [ -z "$NONDOCS" ]; then CODE=false; fi
+            fi
+          fi
+          # Content-hash the lockfile (robust for site-dir='.' and subdirs alike).
+          LOCK="${SITE_DIR%/}/package-lock.json"; LOCK="${LOCK#./}"
+          if [ -f "$LOCK" ]; then H=$(sha256sum "$LOCK" | cut -d' ' -f1); else H=nolock; fi
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "cache-key=nm-${{ runner.os }}-node${NODE_VERSION}-${H}" >> "$GITHUB_OUTPUT"
+          echo "changes: code=$CODE cache-key=nm-${{ runner.os }}-node${NODE_VERSION}-${H}"
+
+  # Prewarm the shared node_modules cache exactly once so the parallel check jobs restore it
+  # instead of each running `npm ci`. Skipped on docs-only changes (code=='false').
+  setup:
+    name: setup
+    needs: changes
+    if: ${{ needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -72,45 +130,116 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
-      - run: npm ci --prefer-offline --no-audit --no-fund
-      - run: npm run typecheck
+      - name: Restore node_modules
+        id: nm
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cold cache only)
+        if: ${{ steps.nm.outputs.cache-hit != 'true' }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+  typecheck:
+    name: typecheck
+    needs: [changes, setup]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — typecheck not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run typecheck
 
   lint:
     name: lint
-    if: ${{ inputs.run-lint }}
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-lint }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ inputs.site-dir }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — lint not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
-      - run: npm ci --prefer-offline --no-audit --no-fund
-      - run: npm run lint
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run lint
 
   format:
     name: format
-    if: ${{ inputs.run-format }}
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-format }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ inputs.site-dir }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — format not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
-      - run: npm ci --prefer-offline --no-audit --no-fund
-      - run: npm run format:check
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run format:check
 
   build:
     name: build
+    needs: [changes, setup]
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -120,32 +249,58 @@ jobs:
       PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
       SITE_URL: ${{ inputs.site-url }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — build not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
-      - run: npm ci --prefer-offline --no-audit --no-fund
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
       # build-script via env + quoting (avoids run-expression injection; enforces a single
       # npm script name — compound builds must be a dedicated package.json script).
-      - env:
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
           BUILD_SCRIPT: ${{ inputs.build-script }}
         run: npm run "$BUILD_SCRIPT"
 
+  # Studio has its own lockfile/dir and a single consumer, so there's no redundant install
+  # to dedupe — it keeps its own npm ci (setup-node's ~/.npm cache). Skipped on docs-only.
   studio-build:
     name: studio-build
-    if: ${{ inputs.has-studio }}
+    needs: changes
+    if: ${{ always() && inputs.has-studio }}
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ inputs.studio-dir }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — studio-build not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
           cache-dependency-path: ${{ inputs.studio-dir }}/package-lock.json
-      - run: npm ci --prefer-offline --no-audit --no-fund
-      - run: npm run build
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run build
