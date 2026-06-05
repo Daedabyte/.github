@@ -60,6 +60,12 @@ on:
       site-url:
         type: string
         default: ""
+      # #4 — advisory Lighthouse budgets. Opt-in: a repo sets run-lighthouse: true AND
+      # commits <site-dir>/lighthouserc.json. The job is ADVISORY (never in any ruleset),
+      # so a red Lighthouse never blocks a PR. Default false = no effect until opted in.
+      run-lighthouse:
+        type: boolean
+        default: false
 
 # Least-privilege default token: every job here only checks out + builds, so read is all
 # they need. Setting any key zeroes all unlisted scopes — the desired posture. A reusable
@@ -304,3 +310,54 @@ jobs:
         run: npm ci --prefer-offline --no-audit --no-fund
       - if: ${{ needs.changes.outputs.code != 'false' }}
         run: npm run build
+
+  # #4 — ADVISORY Lighthouse / a11y / SEO budgets. Opt-in (run-lighthouse + a committed
+  # <site-dir>/lighthouserc.json). NEVER a required status check — keep `ci / lighthouse`
+  # OUT of every ruleset so a flaky perf score can never lock a PR. Builds the site, lets
+  # LHCI serve dist/ (staticDistDir in the config), asserts lenient budgets, and uploads a
+  # public report link. Skipped on docs-only changes. CCC (SSR) stays opted-out.
+  lighthouse:
+    name: lighthouse
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-lighthouse }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — lighthouse skipped. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+      - name: Run Lighthouse CI (advisory)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: treosh/lighthouse-ci-action@3e7e23fb74242897f95c0ba9cabad3d0227b9b18  # v12.6.2
+        with:
+          configPath: ${{ inputs.site-dir }}/lighthouserc.json
+          uploadArtifacts: true
+          temporaryPublicStorage: true
