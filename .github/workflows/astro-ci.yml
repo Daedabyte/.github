@@ -427,6 +427,13 @@ jobs:
     needs: [changes, setup]
     if: ${{ always() && inputs.run-smoke && github.actor == 'dependabot[bot]' }}
     runs-on: ubuntu-latest
+    # dependabot/fetch-metadata needs pull-requests: read to query the PR (without it the
+    # step fails "Resource not accessible by integration"). The crawl itself only reads the
+    # checkout. No write scope here — the merge is enabled by dependabot-automerge.yml, not
+    # this job. Bounded by the caller's grant (callers already pass pull-requests: write).
+    permissions:
+      contents: read
+      pull-requests: read
     defaults:
       run:
         working-directory: ${{ inputs.site-dir }}
