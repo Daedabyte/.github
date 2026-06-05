@@ -66,6 +66,12 @@ on:
       run-lighthouse:
         type: boolean
         default: false
+      # 09 — smoke gate. Default ON for static sites; runs ONLY on Dependabot MAJOR PRs
+      # (the job self-gates on actor + semver-major + not-incident-class). CCC (SSR) sets
+      # this false (static dist can't serve an SSR app). NOT a ruleset-required check.
+      run-smoke:
+        type: boolean
+        default: true
 
 # Least-privilege default token: every job here only checks out + builds, so read is all
 # they need. Setting any key zeroes all unlisted scopes — the desired posture. A reusable
@@ -407,3 +413,190 @@ jobs:
         with:
           header: lighthouse
           path: lhci-comment.md
+
+  # 09 — SMOKE gate. Exercises the rendered site so majors become safe to auto-merge.
+  # Runs ONLY on Dependabot MAJOR, non-incident-class PRs (self-gated below). Builds,
+  # serves dist/ with a dependency-free node static server, auto-discovers routes from the
+  # sitemap (fallback dist/**/*.html), asserts 200 + non-empty render + 0 console errors in
+  # headless chromium. NOT in any ruleset (it doesn't run on human PRs, so a missing context
+  # could never lock a PR); dependabot-automerge.yml polls THIS check's result to gate merge.
+  # Honors the #3 docs-only skip + node_modules cache. Playwright is installed in an isolated
+  # temp project so the caller repo gains no dependency.
+  smoke:
+    name: smoke
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-smoke && github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — smoke not needed. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - id: meta
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a  # v2.5.0
+      # Self-gate: crawl ONLY for a MAJOR bump that is not the incident class. Otherwise this
+      # job reports success without doing work (safe — smoke is not a required check).
+      - name: Decide whether to crawl
+        id: gate
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          crawl=false
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            case "$DEP_NAMES" in
+              *sanity*|*drizzle*|*postgres*|*better-auth*|*stripe*) crawl=false ;;
+              *) crawl=true ;;
+            esac
+          fi
+          echo "crawl=$crawl" >> "$GITHUB_OUTPUT"
+          echo "update-type=$UPDATE_TYPE names=[$DEP_NAMES] -> crawl=$crawl"
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+      - name: Smoke crawl (isolated Playwright)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          SITE_DIR: ${{ inputs.site-dir }}
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/smoke"
+          mkdir -p "$work"
+          cat > "$work/smoke.mjs" <<'SMOKE_EOF'
+          // Smoke crawler: serve a built Astro dist/, discover routes, assert each renders.
+          // Usage: node smoke.mjs <abs-path-to-dist>
+          // Exit 0 = all routes pass; exit 1 = any route fails (or no routes found).
+          import { chromium } from 'playwright';
+          import { createServer } from 'node:http';
+          import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+          import { join, extname, relative, sep } from 'node:path';
+          
+          const DIST = process.argv[2] || 'dist';
+          const PORT = 4321;
+          // Central console-error allowlist — regexes for known-benign errors. Starts EMPTY (strict).
+          const ALLOWLIST = [];
+          
+          const MIME = {
+            '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+            '.mjs': 'text/javascript', '.json': 'application/json', '.svg': 'image/svg+xml',
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+            '.avif': 'image/avif', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+            '.txt': 'text/plain', '.xml': 'application/xml', '.gif': 'image/gif',
+          };
+          
+          const server = createServer((req, res) => {
+            try {
+              const p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+              let fp = join(DIST, p);
+              if (existsSync(fp) && statSync(fp).isDirectory()) fp = join(fp, 'index.html');
+              if (!existsSync(fp) && existsSync(fp + '.html')) fp = fp + '.html';
+              if (!existsSync(fp)) { res.statusCode = 404; res.end('not found'); return; }
+              res.setHeader('Content-Type', MIME[extname(fp)] || 'application/octet-stream');
+              res.end(readFileSync(fp));
+            } catch (e) { res.statusCode = 500; res.end(String(e)); }
+          });
+          await new Promise((r) => server.listen(PORT, r));
+          
+          function fromSitemap() {
+            let xml = '';
+            const sm = join(DIST, 'sitemap.xml');
+            const idx = join(DIST, 'sitemap-index.xml');
+            if (existsSync(sm)) xml = readFileSync(sm, 'utf8');
+            else if (existsSync(idx)) {
+              const subs = [...readFileSync(idx, 'utf8').matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+              for (const s of subs) {
+                const f = join(DIST, s.split('/').pop());
+                if (existsSync(f)) xml += readFileSync(f, 'utf8');
+              }
+            }
+            if (!xml) return null;
+            const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)]
+              .map((m) => { try { return new URL(m[1]).pathname; } catch { return null; } })
+              .filter(Boolean);
+            return locs.length ? [...new Set(locs)] : null;
+          }
+          function fromGlob(dir = DIST, base = DIST) {
+            let out = [];
+            for (const name of readdirSync(dir)) {
+              const fp = join(dir, name);
+              if (statSync(fp).isDirectory()) out = out.concat(fromGlob(fp, base));
+              else if (extname(fp) === '.html') {
+                let rel = '/' + relative(base, fp).split(sep).join('/');
+                rel = rel.replace(/index\.html$/, '').replace(/\.html$/, '');
+                out.push(rel === '' ? '/' : rel);
+              }
+            }
+            return out;
+          }
+          
+          const routes = fromSitemap() || [...new Set(fromGlob())];
+          if (!routes.length) { console.error('No routes discovered in ' + DIST); process.exit(1); }
+          console.log(`Discovered ${routes.length} route(s): ${routes.join(', ')}`);
+          
+          const browser = await chromium.launch();
+          let failures = 0;
+          for (const route of routes) {
+            const ctx = await browser.newContext();
+            const page = await ctx.newPage();
+            const errs = [];
+            page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}`));
+            page.on('console', (m) => {
+              if (m.type() === 'error') {
+                const t = m.text();
+                if (!ALLOWLIST.some((rx) => rx.test(t))) errs.push(`console.error: ${t}`);
+              }
+            });
+            let status = 0;
+            try {
+              const resp = await page.goto(`http://localhost:${PORT}${route}`, { waitUntil: 'networkidle', timeout: 30000 });
+              status = resp ? resp.status() : 0;
+            } catch (e) { errs.push(`navigation: ${e.message}`); }
+            const bodyLen = await page.evaluate(() => (document.body ? document.body.innerText.trim().length : 0)).catch(() => 0);
+            const problems = [];
+            if (status !== 200) problems.push(`status ${status}`);
+            if (bodyLen === 0) problems.push('empty render (body has no text)');
+            problems.push(...errs);
+            if (problems.length) { failures++; console.error(`FAIL ${route}: ${problems.join('; ')}`); }
+            else console.log(`PASS ${route} (200, body ${bodyLen} chars)`);
+            await ctx.close();
+          }
+          await browser.close();
+          server.close();
+          if (failures) { console.error(`\n${failures}/${routes.length} route(s) failed smoke.`); process.exit(1); }
+          console.log(`\nAll ${routes.length} route(s) passed smoke.`);
+          SMOKE_EOF
+          cd "$work"
+          npm init -y >/dev/null 2>&1
+          npm i --no-audit --no-fund playwright@1.50.1 >/dev/null
+          npx playwright install chromium >/dev/null
+          node smoke.mjs "${GITHUB_WORKSPACE}/${SITE_DIR%/}/dist"
