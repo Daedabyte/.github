@@ -6,9 +6,8 @@ name: Astro CI (reusable)
 #       uses: Daedabyte/.github/.github/workflows/astro-ci.yml@ci-v1
 # Resulting check contexts are prefixed by the caller job id, e.g. `ci / typecheck`.
 #
-# Roadmap: #1 (centralization) · #6 (contents:read default + SHA-pinned actions) ·
-# #3 (CI-minutes: `setup` prewarm + shared node_modules cache, lockout-safe docs filter).
-# See .ai/plans/github-optimization/{01,03,06}-*.md.
+# Capabilities: centralized CI · contents:read default + SHA-pinned actions ·
+# CI-minutes (`setup` prewarm + shared node_modules cache, lockout-safe docs filter).
 #
 # LOCKOUT SAFETY (#3): every required check job (typecheck/lint/format/build/studio-build)
 # ALWAYS runs and ALWAYS reports a status under its exact name. On a docs/.ai/markdown-only
@@ -37,26 +36,26 @@ on:
         type: string
         default: "studio"
       build-script:
-        description: "npm script for the build check (CCC uses build:ci)."
+        description: "npm script for the build check (some sites use a custom build:ci)."
         type: string
         default: "build"
       run-lint:
-        description: "Run the lint check (CCC has no ESLint -> false)."
+        description: "Run the lint check (sites without ESLint -> false)."
         type: boolean
         default: true
       run-format:
-        description: "Run the format check (CCC has no Prettier -> false)."
+        description: "Run the format check (sites without Prettier -> false)."
         type: boolean
         default: true
       # Public Sanity values, build-only. Empty for non-Sanity sites. Callers may pass
-      # literals (Littlecheese/MountHeritage/Daedabyte) or `${{ vars.* }}` (CCC).
+      # literals or `${{ vars.* }}`.
       public-sanity-project-id:
         type: string
         default: ""
       public-sanity-dataset:
         type: string
         default: ""
-      # Optional build-time SITE_URL (CCC's build:ci relies on it). Empty = unset.
+      # Optional build-time SITE_URL (some build:ci scripts rely on it). Empty = unset.
       site-url:
         type: string
         default: ""
@@ -67,14 +66,14 @@ on:
         type: boolean
         default: false
       # 09 — smoke gate. Default ON for static sites; runs ONLY on Dependabot MAJOR PRs
-      # (the job self-gates on actor + semver-major + not-incident-class). CCC (SSR) sets
+      # (the job self-gates on actor + semver-major + not-incident-class). SSR sites set
       # this false (static dist can't serve an SSR app). NOT a ruleset-required check.
       run-smoke:
         type: boolean
         default: true
-      # 10 — SSR smoke variant (opt-in; CCC only). Boots the built @astrojs/node standalone
+      # 10 — SSR smoke variant (opt-in). Boots the built @astrojs/node standalone
       # server and crawls public routes over HTTP (route discovery via the server's sitemap).
-      # CCC sets run-smoke: false + run-smoke-ssr: true. NOT a ruleset-required check.
+      # SSR sites set run-smoke: false + run-smoke-ssr: true. NOT a ruleset-required check.
       run-smoke-ssr:
         type: boolean
         default: false
@@ -327,7 +326,7 @@ jobs:
   # <site-dir>/lighthouserc.json). NEVER a required status check — keep `ci / lighthouse`
   # OUT of every ruleset so a flaky perf score can never lock a PR. Builds the site, lets
   # LHCI serve dist/ (staticDistDir in the config), asserts lenient budgets, and uploads a
-  # public report link. Skipped on docs-only changes. CCC (SSR) stays opted-out.
+  # public report link. Skipped on docs-only changes. SSR sites stay opted-out.
   lighthouse:
     name: lighthouse
     needs: [changes, setup]
@@ -666,7 +665,7 @@ jobs:
   # 10 — SSR SMOKE. Opt-in (run-smoke-ssr). Boots the REAL built @astrojs/node standalone
   # server and crawls public routes over HTTP (routes discovered from the server's own
   # sitemap). Self-gated to Dependabot non-incident MAJORS; NOT a ruleset-required check;
-  # enforced via dependabot-automerge.yml (CCC's gate polls `ci / smoke-ssr`). The crawl/
+  # enforced via dependabot-automerge.yml (an SSR site's gate polls `ci / smoke-ssr`). The crawl/
   # assert logic is the SAME smoke.mjs as the static smoke job, in `url` mode.
   smoke-ssr:
     name: smoke-ssr

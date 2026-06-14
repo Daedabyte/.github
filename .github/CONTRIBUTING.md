@@ -14,5 +14,3 @@ Every PR into `staging`/`main` must pass `typecheck`, `lint`, `format`, `build`.
 Squash-only into `staging`; `staging → main` promotions merge as a merge commit. The
 repo auto-deletes the branch on merge. Use `gh pr merge --squash` (or `--merge` for a
 promotion).
-
-Full standard: `clients/.ai/guidelines/github-standards.md`.
