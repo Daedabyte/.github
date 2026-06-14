@@ -1,0 +1,931 @@
+name: Astro CI (reusable)
+
+# Central reusable CI for Daedabyte Astro repos. Callers invoke it as:
+#   jobs:
+#     ci:
+#       uses: Daedabyte/.github/.github/workflows/astro-ci.yml@ci-v1
+# Resulting check contexts are prefixed by the caller job id, e.g. `ci / typecheck`.
+#
+# Capabilities: centralized CI · contents:read default + SHA-pinned actions ·
+# CI-minutes (`setup` prewarm + shared node_modules cache, lockout-safe docs filter).
+#
+# LOCKOUT SAFETY (#3): every required check job (typecheck/lint/format/build/studio-build)
+# ALWAYS runs and ALWAYS reports a status under its exact name. On a docs/.ai/markdown-only
+# change the heavy steps are skipped but the job still SUCCEEDS, so the ruleset-required
+# `ci / *` contexts are never missing -> a PR can never lock. Rules that keep this true:
+#   * NEVER add `paths-ignore`/`paths` to `on:` (a filtered-out workflow reports nothing).
+#   * NEVER give a required job a job-level `if:` that resolves to "skipped".
+#   * The `changes` filter FAILS SAFE: any uncertainty -> code='true' (full CI). Jobs treat
+#     ONLY an explicit code=='false' as "docs-only" -> if `changes` errored, real CI runs.
+
+on:
+  workflow_call:
+    inputs:
+      site-dir:
+        description: "Workspace dir for the Astro app (root='.', monorepos='site' or 'daedabyte')."
+        type: string
+        default: "."
+      node-version:
+        type: string
+        default: "22"
+      has-studio:
+        description: "Run the studio-build job against <studio-dir>."
+        type: boolean
+        default: false
+      studio-dir:
+        type: string
+        default: "studio"
+      build-script:
+        description: "npm script for the build check (some sites use a custom build:ci)."
+        type: string
+        default: "build"
+      run-lint:
+        description: "Run the lint check (sites without ESLint -> false)."
+        type: boolean
+        default: true
+      run-format:
+        description: "Run the format check (sites without Prettier -> false)."
+        type: boolean
+        default: true
+      # Public Sanity values, build-only. Empty for non-Sanity sites. Callers may pass
+      # literals or `${{ vars.* }}`.
+      public-sanity-project-id:
+        type: string
+        default: ""
+      public-sanity-dataset:
+        type: string
+        default: ""
+      # Optional build-time SITE_URL (some build:ci scripts rely on it). Empty = unset.
+      site-url:
+        type: string
+        default: ""
+      # #4 — advisory Lighthouse budgets. Opt-in: a repo sets run-lighthouse: true AND
+      # commits <site-dir>/lighthouserc.json. The job is ADVISORY (never in any ruleset),
+      # so a red Lighthouse never blocks a PR. Default false = no effect until opted in.
+      run-lighthouse:
+        type: boolean
+        default: false
+      # 09 — smoke gate. Default ON for static sites; runs ONLY on Dependabot MAJOR PRs
+      # (the job self-gates on actor + semver-major + not-incident-class). SSR sites set
+      # this false (static dist can't serve an SSR app). NOT a ruleset-required check.
+      run-smoke:
+        type: boolean
+        default: true
+      # 10 — SSR smoke variant (opt-in). Boots the built @astrojs/node standalone
+      # server and crawls public routes over HTTP (route discovery via the server's sitemap).
+      # SSR sites set run-smoke: false + run-smoke-ssr: true. NOT a ruleset-required check.
+      run-smoke-ssr:
+        type: boolean
+        default: false
+
+# Least-privilege default token: every job here only checks out + builds, so read is all
+# they need. Setting any key zeroes all unlisted scopes — the desired posture. A reusable
+# workflow's effective token is also bounded by the caller's grant.
+permissions:
+  contents: read
+
+jobs:
+  # Decide whether the change touches code (vs docs/.ai/markdown only) and compute the
+  # shared node_modules cache key ONCE. Runs at repo root (no site-dir working-directory).
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.meta.outputs.code }}
+      cache-key: ${{ steps.meta.outputs.cache-key }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: meta
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SITE_DIR: ${{ inputs.site-dir }}
+          NODE_VERSION: ${{ inputs.node-version }}
+        run: |
+          set -uo pipefail
+          # Fail safe: assume code changed unless we can PROVE the diff is docs-only.
+          CODE=true
+          RANGE=""
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE" >/dev/null 2>&1 || true
+            RANGE="origin/$BASE...HEAD"
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="$BEFORE...HEAD"
+          fi
+          if [ -n "$RANGE" ]; then
+            if CHANGED=$(git diff --name-only "$RANGE" 2>/dev/null); then
+              # Strip docs paths (*.md, .ai/**, **/.ai/**, docs/**). Anything left = code.
+              # .github/workflows/* is NOT docs -> a CI change always forces a full run.
+              NONDOCS=$(printf '%s\n' "$CHANGED" | grep -vE '(\.md$|^\.ai/|/\.ai/|^docs/)' || true)
+              if [ -z "$NONDOCS" ]; then CODE=false; fi
+            fi
+          fi
+          # Content-hash the lockfile (robust for site-dir='.' and subdirs alike).
+          LOCK="${SITE_DIR%/}/package-lock.json"; LOCK="${LOCK#./}"
+          if [ -f "$LOCK" ]; then H=$(sha256sum "$LOCK" | cut -d' ' -f1); else H=nolock; fi
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "cache-key=nm-${{ runner.os }}-node${NODE_VERSION}-${H}" >> "$GITHUB_OUTPUT"
+          echo "changes: code=$CODE cache-key=nm-${{ runner.os }}-node${NODE_VERSION}-${H}"
+
+  # Prewarm the shared node_modules cache exactly once so the parallel check jobs restore it
+  # instead of each running `npm ci`. Skipped on docs-only changes (code=='false').
+  setup:
+    name: setup
+    needs: changes
+    if: ${{ needs.changes.outputs.code != 'false' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - name: Restore node_modules
+        id: nm
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cold cache only)
+        if: ${{ steps.nm.outputs.cache-hit != 'true' }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+  typecheck:
+    name: typecheck
+    needs: [changes, setup]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — typecheck not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run typecheck
+
+  lint:
+    name: lint
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-lint }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — lint not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run lint
+
+  format:
+    name: format
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-format }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — format not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run format:check
+
+  build:
+    name: build
+    needs: [changes, setup]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — build not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      # build-script via env + quoting (avoids run-expression injection; enforces a single
+      # npm script name — compound builds must be a dedicated package.json script).
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+
+  # Studio has its own lockfile/dir and a single consumer, so there's no redundant install
+  # to dedupe — it keeps its own npm ci (setup-node's ~/.npm cache). Skipped on docs-only.
+  studio-build:
+    name: studio-build
+    needs: changes
+    if: ${{ always() && inputs.has-studio }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.studio-dir }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — studio-build not required. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.studio-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        run: npm run build
+
+  # #4 — ADVISORY Lighthouse / a11y / SEO budgets. Opt-in (run-lighthouse + a committed
+  # <site-dir>/lighthouserc.json). NEVER a required status check — keep `ci / lighthouse`
+  # OUT of every ruleset so a flaky perf score can never lock a PR. Builds the site, lets
+  # LHCI serve dist/ (staticDistDir in the config), asserts lenient budgets, and uploads a
+  # public report link. Skipped on docs-only changes. SSR sites stay opted-out.
+  lighthouse:
+    name: lighthouse
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-lighthouse }}
+    runs-on: ubuntu-latest
+    # pull-requests: write lets this job post the sticky score comment. It is bounded by the
+    # CALLER's grant — an opted-in caller must add `permissions: { pull-requests: write }`.
+    # The required gating jobs above keep the workflow default (contents: read) — only this
+    # advisory job is elevated.
+    permissions:
+      contents: read
+      pull-requests: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — lighthouse skipped. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+      - name: Run Lighthouse CI (advisory)
+        id: lhci
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: treosh/lighthouse-ci-action@3e7e23fb74242897f95c0ba9cabad3d0227b9b18  # v12.6.2
+        with:
+          configPath: ${{ inputs.site-dir }}/lighthouserc.json
+          uploadArtifacts: true
+          temporaryPublicStorage: true
+      # Build a markdown score table from the LHCI manifest + report links and post it as one
+      # updating ("sticky") PR comment. continue-on-error: advisory surface never fails the job.
+      # Skipped on Dependabot PRs (restricted token) and on push events (no PR to comment on).
+      - name: Build Lighthouse comment
+        id: lhcomment
+        if: ${{ needs.changes.outputs.code != 'false' && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' }}
+        continue-on-error: true
+        working-directory: ${{ github.workspace }}
+        env:
+          MANIFEST: ${{ steps.lhci.outputs.manifest }}
+          LINKS: ${{ steps.lhci.outputs.links }}
+        run: |
+          cat > "${RUNNER_TEMP}/lhci-comment.js" <<'EOF'
+          const fs = require('fs');
+          const m = JSON.parse(process.env.MANIFEST || '[]');
+          const links = JSON.parse(process.env.LINKS || '{}');
+          const pct = v => (v == null ? '—' : Math.round(v * 100));
+          const route = u => { try { return new URL(u).pathname; } catch { return u; } };
+          const rep = m.filter(r => r.isRepresentativeRun);
+          let out = '## 🔦 Lighthouse (advisory — never blocks merge)\n\n';
+          out += '| Page | Perf | A11y | Best Practices | SEO | Report |\n';
+          out += '|---|--:|--:|--:|--:|---|\n';
+          for (const r of rep) {
+            const s = r.summary || {};
+            const link = links[r.url] ? `[report](${links[r.url]})` : '';
+            out += `| \`${route(r.url)}\` | ${pct(s.performance)} | ${pct(s.accessibility)} | ${pct(s['best-practices'])} | ${pct(s.seo)} | ${link} |\n`;
+          }
+          out += '\n_Medians of 3 desktop runs. Budgets are warn-only while baselining; this check never blocks a PR._';
+          fs.writeFileSync('lhci-comment.md', out);
+          EOF
+          node "${RUNNER_TEMP}/lhci-comment.js"
+      - name: Post Lighthouse comment
+        if: ${{ needs.changes.outputs.code != 'false' && github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && steps.lhcomment.outcome == 'success' }}
+        continue-on-error: true
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405  # v2.9.4
+        with:
+          header: lighthouse
+          path: lhci-comment.md
+
+  # 09 — SMOKE gate. Exercises the rendered site so majors become safe to auto-merge.
+  # Runs ONLY on Dependabot MAJOR, non-incident-class PRs (self-gated below). Builds,
+  # serves dist/ with a dependency-free node static server, auto-discovers routes from the
+  # sitemap (fallback dist/**/*.html), asserts 200 + non-empty render + 0 console errors in
+  # headless chromium. NOT in any ruleset (it doesn't run on human PRs, so a missing context
+  # could never lock a PR); dependabot-automerge.yml polls THIS check's result to gate merge.
+  # Honors the #3 docs-only skip + node_modules cache. Playwright is installed in an isolated
+  # temp project so the caller repo gains no dependency.
+  smoke:
+    name: smoke
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-smoke && github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    # dependabot/fetch-metadata needs pull-requests: read to query the PR (without it the
+    # step fails "Resource not accessible by integration"). The crawl itself only reads the
+    # checkout. No write scope here — the merge is enabled by dependabot-automerge.yml, not
+    # this job. Bounded by the caller's grant (callers already pass pull-requests: write).
+    permissions:
+      contents: read
+      pull-requests: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — smoke not needed. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - id: meta
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a  # v2.5.0
+      # Self-gate: crawl ONLY for a MAJOR bump that is not the incident class. Otherwise this
+      # job reports success without doing work (safe — smoke is not a required check).
+      - name: Decide whether to crawl
+        id: gate
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          crawl=false
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            case "$DEP_NAMES" in
+              *sanity*|*drizzle*|*postgres*|*better-auth*|*stripe*) crawl=false ;;
+              *) crawl=true ;;
+            esac
+          fi
+          echo "crawl=$crawl" >> "$GITHUB_OUTPUT"
+          echo "update-type=$UPDATE_TYPE names=[$DEP_NAMES] -> crawl=$crawl"
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - name: Build
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+      - name: Smoke crawl (isolated Playwright)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          SITE_DIR: ${{ inputs.site-dir }}
+        run: |
+          set -euo pipefail
+          work="${RUNNER_TEMP}/smoke"
+          mkdir -p "$work"
+          cat > "$work/smoke.mjs" <<'SMOKE_EOF'
+          // Smoke crawler. Two modes:
+          //   node smoke.mjs dist <abs-path-to-dist>   — serve a built static dist/ and crawl it
+          //   node smoke.mjs url  <base-url>           — crawl an already-running server over HTTP
+          // Routes are discovered from the sitemap (dist: read from disk; url: fetched over HTTP),
+          // with a dist-only glob fallback. Each route must render: HTTP 200 + non-empty body +
+          // 0 console/page errors. Exit 0 = all pass; exit 1 = any fail (or no routes found).
+          import { chromium } from 'playwright';
+          import { createServer } from 'node:http';
+          import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+          import { join, extname, relative, sep } from 'node:path';
+
+          const MODE = process.argv[2] === 'url' ? 'url' : 'dist';
+          const ARG = process.argv[3] ?? 'dist';
+          const PORT = 4321;
+          // Central console-error allowlist — regexes for known-benign errors. Starts EMPTY (strict).
+          const ALLOWLIST = [];
+
+          const MIME = {
+            '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+            '.mjs': 'text/javascript', '.json': 'application/json', '.svg': 'image/svg+xml',
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+            '.avif': 'image/avif', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+            '.txt': 'text/plain', '.xml': 'application/xml', '.gif': 'image/gif',
+          };
+
+          // dist mode: serve the static build over a dependency-free http server.
+          function serveDist(dist) {
+            return createServer((req, res) => {
+              try {
+                const p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+                let fp = join(dist, p);
+                if (existsSync(fp) && statSync(fp).isDirectory()) fp = join(fp, 'index.html');
+                if (!existsSync(fp) && existsSync(fp + '.html')) fp = fp + '.html';
+                if (!existsSync(fp)) { res.statusCode = 404; res.end('not found'); return; }
+                res.setHeader('Content-Type', MIME[extname(fp)] || 'application/octet-stream');
+                res.end(readFileSync(fp));
+              } catch (e) { res.statusCode = 500; res.end(String(e)); }
+            });
+          }
+
+          // dist mode: discover routes from the built sitemap on disk (glob fallback below).
+          function fromSitemap(dist) {
+            let xml = '';
+            const sm = join(dist, 'sitemap.xml');
+            const idx = join(dist, 'sitemap-index.xml');
+            if (existsSync(sm)) xml = readFileSync(sm, 'utf8');
+            else if (existsSync(idx)) {
+              const subs = [...readFileSync(idx, 'utf8').matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+              for (const s of subs) {
+                const f = join(dist, s.split('/').pop());
+                if (existsSync(f)) xml += readFileSync(f, 'utf8');
+              }
+            }
+            if (!xml) return null;
+            const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)]
+              .map((m) => { try { return new URL(m[1]).pathname; } catch { return null; } })
+              .filter(Boolean);
+            return locs.length ? [...new Set(locs)] : null;
+          }
+          function fromGlob(dir, base) {
+            let out = [];
+            for (const name of readdirSync(dir)) {
+              const fp = join(dir, name);
+              if (statSync(fp).isDirectory()) out = out.concat(fromGlob(fp, base));
+              else if (extname(fp) === '.html') {
+                let rel = '/' + relative(base, fp).split(sep).join('/');
+                rel = rel.replace(/index\.html$/, '').replace(/\.html$/, '');
+                out.push(rel === '' ? '/' : rel);
+              }
+            }
+            return out;
+          }
+
+          // url mode: discover routes by fetching the server's sitemap over HTTP.
+          async function discoverFromServer(base) {
+            async function locs(url) {
+              try {
+                const r = await fetch(url);
+                if (!r.ok) return [];
+                const xml = await r.text();
+                return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+              } catch { return []; }
+            }
+            // Sitemap <loc>s carry the build's `site` origin (e.g. https://prod.example),
+            // NOT the server-under-test. Swap every origin to `base` so we discover and crawl
+            // the ROUTES THIS BUILD PRODUCED — never production's live (possibly stale) routeset.
+            const toLocal = (u) => { try { return base + new URL(u).pathname; } catch { return null; } };
+            const idx = await locs(`${base}/sitemap-index.xml`);
+            let pageUrls = [];
+            if (idx.length && idx.every((u) => /sitemap.*\.xml$/.test(u))) {
+              for (const sm of idx) {
+                const local = toLocal(sm);
+                if (local) pageUrls.push(...(await locs(local)));
+              }
+            } else {
+              pageUrls = idx.length ? idx : await locs(`${base}/sitemap.xml`);
+            }
+            const paths = pageUrls
+              .map((u) => { try { return new URL(u).pathname; } catch { return null; } })
+              .filter(Boolean);
+            return paths.length ? [...new Set(paths)] : ['/'];
+          }
+
+          // --- set up the crawl target by mode -------------------------------------------------
+          let BASE;
+          let server = null;
+          let routes;
+          if (MODE === 'url') {
+            BASE = ARG.replace(/\/$/, '');
+            routes = await discoverFromServer(BASE);
+          } else {
+            const DIST = ARG;
+            server = serveDist(DIST);
+            await new Promise((r) => server.listen(PORT, r));
+            BASE = `http://localhost:${PORT}`;
+            routes = fromSitemap(DIST) || [...new Set(fromGlob(DIST, DIST))];
+          }
+          if (!routes.length) { console.error('No routes discovered'); process.exit(1); }
+          console.log(`Discovered ${routes.length} route(s): ${routes.join(', ')}`);
+
+          const browser = await chromium.launch();
+          let failures = 0;
+          for (const route of routes) {
+            const ctx = await browser.newContext();
+            const page = await ctx.newPage();
+            const errs = [];
+            page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}`));
+            page.on('console', (m) => {
+              if (m.type() === 'error') {
+                const t = m.text();
+                if (!ALLOWLIST.some((rx) => rx.test(t))) errs.push(`console.error: ${t}`);
+              }
+            });
+            let status = 0;
+            try {
+              const resp = await page.goto(`${BASE}${route}`, { waitUntil: 'networkidle', timeout: 30000 });
+              status = resp ? resp.status() : 0;
+            } catch (e) { errs.push(`navigation: ${e.message}`); }
+            const bodyLen = await page.evaluate(() => (document.body ? document.body.innerText.trim().length : 0)).catch(() => 0);
+            const problems = [];
+            if (status !== 200) problems.push(`status ${status}`);
+            if (bodyLen === 0) problems.push('empty render (body has no text)');
+            problems.push(...errs);
+            if (problems.length) { failures++; console.error(`FAIL ${route}: ${problems.join('; ')}`); }
+            else console.log(`PASS ${route} (200, body ${bodyLen} chars)`);
+            await ctx.close();
+          }
+          await browser.close();
+          if (server) server.close();
+          if (failures) { console.error(`\n${failures}/${routes.length} route(s) failed smoke.`); process.exit(1); }
+          console.log(`\nAll ${routes.length} route(s) passed smoke.`);
+          SMOKE_EOF
+          cd "$work"
+          npm init -y >/dev/null 2>&1
+          npm i --no-audit --no-fund playwright@1.50.1 >/dev/null
+          npx playwright install chromium >/dev/null
+          node smoke.mjs dist "${GITHUB_WORKSPACE}/${SITE_DIR%/}/dist"
+  # 10 — SSR SMOKE. Opt-in (run-smoke-ssr). Boots the REAL built @astrojs/node standalone
+  # server and crawls public routes over HTTP (routes discovered from the server's own
+  # sitemap). Self-gated to Dependabot non-incident MAJORS; NOT a ruleset-required check;
+  # enforced via dependabot-automerge.yml (an SSR site's gate polls `ci / smoke-ssr`). The crawl/
+  # assert logic is the SAME smoke.mjs as the static smoke job, in `url` mode.
+  smoke-ssr:
+    name: smoke-ssr
+    needs: [changes, setup]
+    if: ${{ always() && inputs.run-smoke-ssr && github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read   # fetch-metadata (see lesson gha-reusable-workflow-permissions)
+    defaults:
+      run:
+        working-directory: ${{ inputs.site-dir }}
+    env:
+      PUBLIC_SANITY_PROJECT_ID: ${{ inputs.public-sanity-project-id }}
+      PUBLIC_SANITY_DATASET: ${{ inputs.public-sanity-dataset }}
+      SITE_URL: ${{ inputs.site-url }}
+    steps:
+      - name: Skip (docs-only change)
+        if: ${{ needs.changes.outputs.code == 'false' }}
+        working-directory: ${{ github.workspace }}
+        run: echo "Docs/.ai/markdown-only change — smoke-ssr not needed. Reporting success."
+      - if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - id: meta
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a  # v2.5.0
+      # Self-gate: crawl ONLY for a MAJOR bump that is not the incident class. Otherwise this
+      # job reports success without doing work (safe — smoke-ssr is not a required check).
+      - name: Decide whether to crawl
+        id: gate
+        if: ${{ needs.changes.outputs.code != 'false' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          crawl=false
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            case "$DEP_NAMES" in
+              *sanity*|*drizzle*|*postgres*|*better-auth*|*stripe*) crawl=false ;;
+              *) crawl=true ;;
+            esac
+          fi
+          echo "crawl=$crawl" >> "$GITHUB_OUTPUT"
+          echo "update-type=$UPDATE_TYPE names=[$DEP_NAMES] -> crawl=$crawl"
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.site-dir }}/package-lock.json
+      - if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ inputs.site-dir }}/node_modules
+          key: ${{ needs.changes.outputs.cache-key }}
+      - name: Install (cache-miss safety net)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        run: '[ -d node_modules ] || npm ci --prefer-offline --no-audit --no-fund'
+      - name: Build (deploy-faithful)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        env:
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+        run: npm run "$BUILD_SCRIPT"
+      - name: Boot SSR server + smoke over HTTP (isolated Playwright)
+        if: ${{ needs.changes.outputs.code != 'false' && steps.gate.outputs.crawl == 'true' }}
+        working-directory: ${{ github.workspace }}
+        env:
+          SITE_DIR: ${{ inputs.site-dir }}
+          BETTER_AUTH_SECRET: ci-dummy-secret-ci-dummy-secret-32
+          BETTER_AUTH_URL: http://127.0.0.1:4321
+        run: |
+          set -euo pipefail
+          site="${GITHUB_WORKSPACE}/${SITE_DIR%/}"
+          entry="$site/.amplify-hosting/compute/default/server/entry.mjs"
+          test -f "$entry" || { echo "SSR entry not found at $entry"; exit 1; }
+          # Boot the standalone server in the background. Sanity from job env renders the
+          # public Sanity-backed pages; dummy better-auth lets it boot; NO DB needed —
+          # middleware degrades a missing DB to anonymous, so public pages still render.
+          HOST=127.0.0.1 PORT=4321 \
+            PUBLIC_SANITY_PROJECT_ID="$PUBLIC_SANITY_PROJECT_ID" \
+            PUBLIC_SANITY_DATASET="$PUBLIC_SANITY_DATASET" \
+            node "$entry" & SRV=$!
+          # Wait up to 60s for the port; bail early if the process dies.
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null "http://127.0.0.1:4321/login"; then break; fi
+            if ! kill -0 "$SRV" 2>/dev/null; then echo "server exited early"; exit 1; fi
+            sleep 1
+          done
+          # Fail fast (clear diagnostic, no wasted Playwright install) if the loop
+          # exhausted without the server ever responding on the port.
+          if ! curl -fsS -o /dev/null "http://127.0.0.1:4321/login"; then
+            echo "server did not become ready within 60s"
+            kill "$SRV" 2>/dev/null || true
+            exit 1
+          fi
+          # Crawl via the isolated Playwright project + shared smoke.mjs (url mode).
+          work="${RUNNER_TEMP}/smoke"
+          mkdir -p "$work"
+          cat > "$work/smoke.mjs" <<'SMOKE_EOF'
+          // Smoke crawler. Two modes:
+          //   node smoke.mjs dist <abs-path-to-dist>   — serve a built static dist/ and crawl it
+          //   node smoke.mjs url  <base-url>           — crawl an already-running server over HTTP
+          // Routes are discovered from the sitemap (dist: read from disk; url: fetched over HTTP),
+          // with a dist-only glob fallback. Each route must render: HTTP 200 + non-empty body +
+          // 0 console/page errors. Exit 0 = all pass; exit 1 = any fail (or no routes found).
+          import { chromium } from 'playwright';
+          import { createServer } from 'node:http';
+          import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs';
+          import { join, extname, relative, sep } from 'node:path';
+
+          const MODE = process.argv[2] === 'url' ? 'url' : 'dist';
+          const ARG = process.argv[3] ?? 'dist';
+          const PORT = 4321;
+          // Central console-error allowlist — regexes for known-benign errors. Starts EMPTY (strict).
+          const ALLOWLIST = [];
+
+          const MIME = {
+            '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+            '.mjs': 'text/javascript', '.json': 'application/json', '.svg': 'image/svg+xml',
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
+            '.avif': 'image/avif', '.ico': 'image/x-icon', '.woff': 'font/woff', '.woff2': 'font/woff2',
+            '.txt': 'text/plain', '.xml': 'application/xml', '.gif': 'image/gif',
+          };
+
+          // dist mode: serve the static build over a dependency-free http server.
+          function serveDist(dist) {
+            return createServer((req, res) => {
+              try {
+                const p = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+                let fp = join(dist, p);
+                if (existsSync(fp) && statSync(fp).isDirectory()) fp = join(fp, 'index.html');
+                if (!existsSync(fp) && existsSync(fp + '.html')) fp = fp + '.html';
+                if (!existsSync(fp)) { res.statusCode = 404; res.end('not found'); return; }
+                res.setHeader('Content-Type', MIME[extname(fp)] || 'application/octet-stream');
+                res.end(readFileSync(fp));
+              } catch (e) { res.statusCode = 500; res.end(String(e)); }
+            });
+          }
+
+          // dist mode: discover routes from the built sitemap on disk (glob fallback below).
+          function fromSitemap(dist) {
+            let xml = '';
+            const sm = join(dist, 'sitemap.xml');
+            const idx = join(dist, 'sitemap-index.xml');
+            if (existsSync(sm)) xml = readFileSync(sm, 'utf8');
+            else if (existsSync(idx)) {
+              const subs = [...readFileSync(idx, 'utf8').matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+              for (const s of subs) {
+                const f = join(dist, s.split('/').pop());
+                if (existsSync(f)) xml += readFileSync(f, 'utf8');
+              }
+            }
+            if (!xml) return null;
+            const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)]
+              .map((m) => { try { return new URL(m[1]).pathname; } catch { return null; } })
+              .filter(Boolean);
+            return locs.length ? [...new Set(locs)] : null;
+          }
+          function fromGlob(dir, base) {
+            let out = [];
+            for (const name of readdirSync(dir)) {
+              const fp = join(dir, name);
+              if (statSync(fp).isDirectory()) out = out.concat(fromGlob(fp, base));
+              else if (extname(fp) === '.html') {
+                let rel = '/' + relative(base, fp).split(sep).join('/');
+                rel = rel.replace(/index\.html$/, '').replace(/\.html$/, '');
+                out.push(rel === '' ? '/' : rel);
+              }
+            }
+            return out;
+          }
+
+          // url mode: discover routes by fetching the server's sitemap over HTTP.
+          async function discoverFromServer(base) {
+            async function locs(url) {
+              try {
+                const r = await fetch(url);
+                if (!r.ok) return [];
+                const xml = await r.text();
+                return [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+              } catch { return []; }
+            }
+            // Sitemap <loc>s carry the build's `site` origin (e.g. https://prod.example),
+            // NOT the server-under-test. Swap every origin to `base` so we discover and crawl
+            // the ROUTES THIS BUILD PRODUCED — never production's live (possibly stale) routeset.
+            const toLocal = (u) => { try { return base + new URL(u).pathname; } catch { return null; } };
+            const idx = await locs(`${base}/sitemap-index.xml`);
+            let pageUrls = [];
+            if (idx.length && idx.every((u) => /sitemap.*\.xml$/.test(u))) {
+              for (const sm of idx) {
+                const local = toLocal(sm);
+                if (local) pageUrls.push(...(await locs(local)));
+              }
+            } else {
+              pageUrls = idx.length ? idx : await locs(`${base}/sitemap.xml`);
+            }
+            const paths = pageUrls
+              .map((u) => { try { return new URL(u).pathname; } catch { return null; } })
+              .filter(Boolean);
+            return paths.length ? [...new Set(paths)] : ['/'];
+          }
+
+          // --- set up the crawl target by mode -------------------------------------------------
+          let BASE;
+          let server = null;
+          let routes;
+          if (MODE === 'url') {
+            BASE = ARG.replace(/\/$/, '');
+            routes = await discoverFromServer(BASE);
+          } else {
+            const DIST = ARG;
+            server = serveDist(DIST);
+            await new Promise((r) => server.listen(PORT, r));
+            BASE = `http://localhost:${PORT}`;
+            routes = fromSitemap(DIST) || [...new Set(fromGlob(DIST, DIST))];
+          }
+          if (!routes.length) { console.error('No routes discovered'); process.exit(1); }
+          console.log(`Discovered ${routes.length} route(s): ${routes.join(', ')}`);
+
+          const browser = await chromium.launch();
+          let failures = 0;
+          for (const route of routes) {
+            const ctx = await browser.newContext();
+            const page = await ctx.newPage();
+            const errs = [];
+            page.on('pageerror', (e) => errs.push(`pageerror: ${e.message}`));
+            page.on('console', (m) => {
+              if (m.type() === 'error') {
+                const t = m.text();
+                if (!ALLOWLIST.some((rx) => rx.test(t))) errs.push(`console.error: ${t}`);
+              }
+            });
+            let status = 0;
+            try {
+              const resp = await page.goto(`${BASE}${route}`, { waitUntil: 'networkidle', timeout: 30000 });
+              status = resp ? resp.status() : 0;
+            } catch (e) { errs.push(`navigation: ${e.message}`); }
+            const bodyLen = await page.evaluate(() => (document.body ? document.body.innerText.trim().length : 0)).catch(() => 0);
+            const problems = [];
+            if (status !== 200) problems.push(`status ${status}`);
+            if (bodyLen === 0) problems.push('empty render (body has no text)');
+            problems.push(...errs);
+            if (problems.length) { failures++; console.error(`FAIL ${route}: ${problems.join('; ')}`); }
+            else console.log(`PASS ${route} (200, body ${bodyLen} chars)`);
+            await ctx.close();
+          }
+          await browser.close();
+          if (server) server.close();
+          if (failures) { console.error(`\n${failures}/${routes.length} route(s) failed smoke.`); process.exit(1); }
+          console.log(`\nAll ${routes.length} route(s) passed smoke.`);
+          SMOKE_EOF
+          cd "$work"
+          npm init -y >/dev/null 2>&1
+          npm i --no-audit --no-fund playwright@1.50.1 >/dev/null
+          npx playwright install chromium >/dev/null
+          # Always kill the server; propagate the crawl's exit code.
+          set +e
+          node smoke.mjs url "http://127.0.0.1:4321"; rc=$?
+          set -e
+          kill "$SRV" 2>/dev/null || true
+          exit "$rc"
