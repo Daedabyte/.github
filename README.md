@@ -1,13 +1,11 @@
 # `Daedabyte/.github`
 
-Org-meta repository for [Daedabyte](https://github.com/Daedabyte). It serves two roles:
+Public org-meta repository for [Daedabyte](https://github.com/Daedabyte).
 
-1. **Org-wide default community-health files.** GitHub auto-surfaces the files under
-   `.github/` (PR template, issue forms, `SECURITY.md`, `CONTRIBUTING.md`) on any
-   Daedabyte repo that doesn't define its own — fill-the-gap inheritance, not a copy.
-2. **Reusable-workflow host.** `.github/workflows/` hosts org-wide reusable GitHub
-   Actions workflows, called by other repos as
-   `uses: Daedabyte/.github/.github/workflows/<file>.yml@<ref>` (note the doubled
-   `.github/.github/`).
+- **Org profile card** — [`profile/README.md`](profile/README.md) renders on the public
+  [Daedabyte org page](https://github.com/Daedabyte).
+- **Default community-health files** — the files under [`.github/`](.github/) (PR template,
+  issue forms, [`SECURITY.md`](.github/SECURITY.md), [`CONTRIBUTING.md`](.github/CONTRIBUTING.md))
+  apply to any Daedabyte repo that doesn't define its own.
 
-The public org landing card lives in [`profile/README.md`](profile/README.md).
+Questions or work inquiries: **[dev@daedabyte.com](mailto:dev@daedabyte.com)**.
